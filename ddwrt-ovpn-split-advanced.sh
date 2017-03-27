@@ -333,7 +333,7 @@ if [ "$(nvram get wshaper_enable)" == "1" ]; then
     err_found=true
 fi
 
-# quit if we fail to meet any configuration requirements
+# quit if we fail to meet any prerequisites
 if [[ $err_found == true ]]; then
     echo "exiting on fatal error(s); correct and reboot"
     exit
@@ -358,7 +358,7 @@ while :; do
         continue
     fi
 
-    # http://svn.dd-wrt.com/ticket/5697
+    # optional: http://svn.dd-wrt.com/ticket/5697
     [ ${TOUCH_DNSMASQ+x} ] && touch /tmp/resolv.dnsmasq
 
     # optional: enable nat loopback (no packet marking conflicts)
