@@ -2,7 +2,7 @@
 export DEBUG= # uncomment/comment to enable/disable debug mode
 
 #         name: ddwrt-ovpn-split-advanced.sh
-#      version: 0.1.4 (beta), 26-mar-2017, by eibgrad
+#      version: 0.1.5 (beta), 28-mar-2017, by eibgrad
 #      purpose: redirect specific traffic over the WAN|VPN
 #  script type: jffs script called from startup script
 # instructions:
@@ -25,7 +25,7 @@ export DEBUG= # uncomment/comment to enable/disable debug mode
 #  limitations:
 #    - this script is NOT compatible w/ policy based routing in the
 #      openvpn client gui
-#    - this script is NOT compatible w/ nat lookback
+#    - this script is NOT compatible w/ nat loopback
 #    - this script is NOT compatible w/ qos
 
 # WARNING: do NOT skip steps #6 thru #9 or it won't work!
@@ -52,6 +52,7 @@ add_rules() {
 # ---------------------------------------------------------------------------- #
 
 # ------------------------------- BEGIN RULES -------------------------------- #
+#return # uncomment/comment to disable/enable all rules
 add_rule -s 192.168.1.10
 add_rule -p tcp -s 192.168.1.112 --dport 80
 add_rule -p tcp -s 192.168.1.122 --dport 3000:3100
@@ -71,6 +72,7 @@ OVPN_ROUTE_UP="/tmp/openvpncl/route-up.sh"
 OVPN_ROUTE_DOWN="/tmp/openvpncl/route-down.sh"
 
 ENV_VARS="$OVPN_DIR/env_vars"
+RPF_VARS="$OVPN_DIR/rpf_vars"
 
 # make environment variables persistent across openvpn events
 [ "$script_type" == "route-up" ] && env > $ENV_VARS
@@ -164,7 +166,7 @@ up() {
 
     # initialize chain for user-defined rules
     $IPT_MAN -A $FW_CHAIN -j CONNMARK --restore-mark
-    $IPT_MAN -A $FW_CHAIN -m mark ! --mark 0 -j ACCEPT
+    $IPT_MAN -A $FW_CHAIN -m mark ! --mark 0 -j RETURN
 
     # add rule for remote access over WAN or VPN
     if [ "$(env_get redirect_gateway)" == "1" ]; then
@@ -188,8 +190,13 @@ up() {
     # clear marks (not available on all builds)
     [ -e /proc/net/clear_marks ] && echo 1 > /proc/net/clear_marks
 
+    > $RPF_VARS
+
     # disable reverse path filtering
-    for i in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 0 > $i; done
+    for i in /proc/sys/net/ipv4/conf/*/rp_filter; do
+        echo "$i=$(cat $i)" >> $RPF_VARS
+        echo 0 > $i
+    done
 
     # start split tunnel
     ip rule add fwmark $FW_MARK table $TID
@@ -201,7 +208,7 @@ down() {
         do :; done
 
     # enable reverse path filtering
-    for i in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 1 > $i; done
+    while read i; do echo ${i#*=} > ${i%=*}; done < $RPF_VARS
 
     # remove rules
     while $IPT_MAN -D PREROUTING -j $FW_CHAIN 2> /dev/null
@@ -223,7 +230,7 @@ down() {
     ip route flush cache
 
     # cleanup
-    rm -f $ENV_VARS
+    rm -f $ENV_VARS $RPF_VARS
 
     # call dd-wrt route-pre-down script
     $OVPN_ROUTE_DOWN
@@ -238,15 +245,15 @@ main() {
 
     # trap event-driven callbacks by openvpn and take appropriate action(s)
     case "$script_type" in
-              "route-up")   up "$@";;
-        "route-pre-down") down "$@";;
+              "route-up")   up;;
+        "route-pre-down") down;;
                        *) echo "WARNING: unexpected invocation: $script_type";;
     esac
 
     return 0
 }
 
-main "$@"
+main
 
 ) 2>&1 | logger -t $(basename $0)[$$]
 EOF
@@ -268,10 +275,11 @@ DEBUG=
 
 # uncomment/comment to enable/disable the following options
 #ONE_PASS= # one pass only; do NOT run continously in background
+ENABLE_SECURE_FIREWALL= # http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
 ENABLE_NAT_LOOPBACK= # replaces dd-wrt nat loopback
 #DEL_PERSIST_TUN= # may help w/ "N RESOLVE" problems
 #DEL_MTU_DISC= # http://svn.dd-wrt.com/ticket/5718
-#TOUCH_DNSMASQ= # http://svn.dd-wrt.com/ticket/5697
+TOUCH_DNSMASQ= # http://svn.dd-wrt.com/ticket/5697
 
 # ---------------------- DO NOT CHANGE BELOW THIS LINE ----------------------- #
 
@@ -282,9 +290,31 @@ SLEEP=10
 
 curr_pid=""
 
+enable_secure_firewall() {
+    _ipt() {
+        # precede insert/append w/ deletion to avoid dups
+        while iptables ${@/-[IA]/-D} 2> /dev/null
+            do :; done
+        iptables $@
+    }
+
+    # allow inbound traffic over the tunnel
+    _ipt -I INPUT -i tun0 -j ACCEPT
+
+    # deny new inbound connections over the tunnel
+    _ipt -I INPUT -i tun0 -m state --state NEW -j DROP
+    _ipt -I FORWARD -i tun0 -m state --state NEW -j DROP
+
+    if [ "$(nvram get openvpncl_nat)" == "1" ]; then
+        # nat all outbound traffic over the tunnel
+        _ipt -t nat -I POSTROUTING -o tun0 -j MASQUERADE
+    fi
+}
+
 enable_nat_loopback() {
     local i=""
 
+    # search for local ip networks
     while :; do
         local lan_ip="$(nvram get lan${i}_ipaddr)"
 
@@ -293,6 +323,7 @@ enable_nat_loopback() {
         local lan_net="$lan_ip/$(nvram get lan${i}_netmask)"
         local lan_if="$(nvram get lan${i}_ifname)"
 
+        # source nat any local ip network routed back into its own network
         iptables -t nat -D POSTROUTING -s $lan_net -o $lan_if -d $lan_net \
             -j SNAT --to $lan_ip 2> /dev/null
         iptables -t nat -A POSTROUTING -s $lan_net -o $lan_if -d $lan_net \
@@ -304,7 +335,7 @@ enable_nat_loopback() {
 
 config_add() { egrep -q "^$1$" $OVPN_CONF || echo "$1" >> $OVPN_CONF; }
 config_rep() { sed -ri "s/^$1$/$2/" $OVPN_CONF; }
-config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # lazy match
+config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # note: lazy match
 
 # wait for syslog to come up
 while [ ! -e /var/log/messages ]; do sleep $SLEEP; done
@@ -347,8 +378,9 @@ while :; do
     while   pidof openvpn > /dev/null 2>&1; do sleep $SLEEP; done
 
     # make adjustments to openvpn config file
+    [ ${ENABLE_SECURE_FIREWALL+x} ] && config_add 'dev tun0'
     [ ${DEL_PERSIST_TUN+x} ] && config_del persist-tun
-    [ ${DEL_MTU_DISC+x}    ] && config_del mtu-disc
+    [ ${DEL_MTU_DISC+x} ] && config_del mtu-disc
 
     # restart openvpn client w/ our configuration changes
     if ! openvpn --config $OVPN_CONF \
@@ -358,16 +390,19 @@ while :; do
         continue
     fi
 
-    # optional: http://svn.dd-wrt.com/ticket/5697
-    [ ${TOUCH_DNSMASQ+x} ] && touch /tmp/resolv.dnsmasq
+    # optional: http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
+    [ ${ENABLE_SECURE_FIREWALL+x} ] && enable_secure_firewall
 
     # optional: enable nat loopback (no packet marking conflicts)
     [ ${ENABLE_NAT_LOOPBACK+x} ] && enable_nat_loopback
 
+    # optional: http://svn.dd-wrt.com/ticket/5697
+    [ ${TOUCH_DNSMASQ+x} ] && touch /tmp/resolv.dnsmasq
+
     # optional: limit to one pass
     [ ${ONE_PASS+x} ] && { echo "done"; exit; }
 
-    # save the new process id
+    # wait for change in process id, then save it
     while [ "$(cat $OVPN_PID)" == "$curr_pid" ]
         do sleep $((SLEEP / 2)); done
     curr_pid="$(cat $OVPN_PID)"
