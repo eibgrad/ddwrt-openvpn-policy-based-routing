@@ -2,7 +2,7 @@
 export DEBUG= # uncomment/comment to enable/disable debug mode
 
 #         name: ddwrt-ovpn-split-basic.sh
-#      version: 0.1.4 (beta), 26-mar-2017, by eibgrad
+#      version: 0.1.5 (beta), 28-mar-2017, by eibgrad
 #      purpose: redirect specific traffic over the WAN|VPN
 #  script type: jffs script called from startup script
 # instructions:
@@ -50,6 +50,7 @@ add_rules() {
 # ---------------------------------------------------------------------------- #
 
 # ------------------------------- BEGIN RULES -------------------------------- #
+#return # uncomment/comment to disable/enable all rules
 
 # specify source ip(s)/network(s)/interface(s) to be rerouted
 add_rule iif br1 # guest network
@@ -184,15 +185,15 @@ main() {
 
     # trap event-driven callbacks by openvpn and take appropriate action(s)
     case "$script_type" in
-              "route-up")   up "$@";;
-        "route-pre-down") down "$@";;
+              "route-up")   up;;
+        "route-pre-down") down;;
                        *) echo "WARNING: unexpected invocation: $script_type";;
     esac
 
     return 0
 }
 
-main "$@"
+main
 
 ) 2>&1 | logger -t $(basename $0)[$$]
 EOF
@@ -214,9 +215,10 @@ DEBUG=
 
 # uncomment/comment to enable/disable the following options
 #ONE_PASS= # one pass only; do NOT run continously in background
+ENABLE_SECURE_FIREWALL= # http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
 #DEL_PERSIST_TUN= # may help w/ "N RESOLVE" problems
 #DEL_MTU_DISC= # http://svn.dd-wrt.com/ticket/5718
-#TOUCH_DNSMASQ= # http://svn.dd-wrt.com/ticket/5697
+TOUCH_DNSMASQ= # http://svn.dd-wrt.com/ticket/5697
 
 # ---------------------- DO NOT CHANGE BELOW THIS LINE ----------------------- #
 
@@ -227,9 +229,30 @@ SLEEP=10
 
 curr_pid=""
 
+enable_secure_firewall() {
+    _ipt() {
+        # precede insert/append w/ deletion to avoid dups
+        while iptables ${@/-[IA]/-D} 2> /dev/null
+            do :; done
+        iptables $@
+    }
+
+    # allow inbound traffic over the tunnel
+    _ipt -I INPUT -i tun0 -j ACCEPT
+
+    # deny new inbound connections over the tunnel
+    _ipt -I INPUT -i tun0 -m state --state NEW -j DROP
+    _ipt -I FORWARD -i tun0 -m state --state NEW -j DROP
+
+    if [ "$(nvram get openvpncl_nat)" == "1" ]; then
+        # nat all outbound traffic over the tunnel
+        _ipt -t nat -I POSTROUTING -o tun0 -j MASQUERADE
+    fi
+}
+
 config_add() { egrep -q "^$1$" $OVPN_CONF || echo "$1" >> $OVPN_CONF; }
 config_rep() { sed -ri "s/^$1$/$2/" $OVPN_CONF; }
-config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # lazy match
+config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # note: lazy match
 
 # wait for syslog to come up
 while [ ! -e /var/log/messages ]; do sleep $SLEEP; done
@@ -253,8 +276,9 @@ while :; do
     while   pidof openvpn > /dev/null 2>&1; do sleep $SLEEP; done
 
     # make adjustments to openvpn config file
+    [ ${ENABLE_SECURE_FIREWALL+x} ] && config_add 'dev tun0'
     [ ${DEL_PERSIST_TUN+x} ] && config_del persist-tun
-    [ ${DEL_MTU_DISC+x}    ] && config_del mtu-disc
+    [ ${DEL_MTU_DISC+x} ] && config_del mtu-disc
 
     # restart openvpn client w/ our configuration changes
     if ! openvpn --config $OVPN_CONF \
@@ -264,13 +288,16 @@ while :; do
         continue
     fi
 
+    # optional: http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
+    [ ${ENABLE_SECURE_FIREWALL+x} ] && enable_secure_firewall
+
     # http://svn.dd-wrt.com/ticket/5697
     [ ${TOUCH_DNSMASQ+x} ] && touch /tmp/resolv.dnsmasq
 
     # optional: limit to one pass
     [ ${ONE_PASS+x} ] && { echo "done"; exit; }
 
-    # save the new process id
+    # wait for change in process id, then save it
     while [ "$(cat $OVPN_PID)" == "$curr_pid" ]
         do sleep $((SLEEP / 2)); done
     curr_pid="$(cat $OVPN_PID)"
