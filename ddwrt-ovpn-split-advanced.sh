@@ -152,7 +152,7 @@ up() {
         local files="$(echo $IMPORT_RULE_FILESPEC)"
 
         if [ "$files" != "$IMPORT_RULE_FILESPEC" ]; then
-            # import rules from filesystem
+            # import (source) rules from filesystem
             for file in $files; do . $file; done
         else
             # use embedded rules
@@ -258,7 +258,7 @@ down() {
     # force routing system to recognize changes
     ip route flush cache
 
-    # cleanup work files
+    # cleanup
     rm -f $ENV_VARS $RPF_VARS $ADDED_ROUTES
 
     # call dd-wrt route-pre-down script
