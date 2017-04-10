@@ -222,9 +222,9 @@ up() {
     ip route flush cache
 
     # disable reverse path filtering
-    for i in /proc/sys/net/ipv4/conf/*/rp_filter; do
-        echo "$i=$(cat $i)" >> $RPF_VARS
-        echo 0 > $i
+    for rpf in /proc/sys/net/ipv4/conf/*/rp_filter; do
+        echo "echo $(cat $rpf) > $rpf" >> $RPF_VARS
+        echo 0 > $rpf
     done
 
     # start split tunnel
@@ -237,7 +237,7 @@ down() {
         do :; done
 
     # enable reverse path filtering
-    while read i; do echo ${i#*=} > ${i%=*}; done < $RPF_VARS
+    while read rpf; do $rpf; done < $RPF_VARS
 
     # remove added routes
     while read route; do $route; done < $ADDED_ROUTES
