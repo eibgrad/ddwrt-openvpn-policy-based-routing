@@ -2,11 +2,14 @@
 export DEBUG= # uncomment/comment to enable/disable debug mode
 
 #         name: ddwrt-ovpn-split-advanced.sh
-#      version: 0.1.5 (beta), 28-mar-2017, by eibgrad
+#      version: 0.1.6 (beta), 09-apr-2017, by eibgrad
 #      purpose: redirect specific traffic over the WAN|VPN
 #  script type: jffs script called from startup script
 # instructions:
-#   1. add/modify rules for rerouting purposes
+#   1. add/modify rules to/in script for rerouting purposes; alternatively,
+#      rules may be imported from filesystem using extension .rule:
+#        /jffs/myrules.rule
+#        /jffs/myrules2.rule
 #   2. copy modified script to /jffs (or external storage, e.g., usb)
 #   3. make script executable:
 #        chmod +x /jffs/ddwrt-ovpn-split-advanced.sh
@@ -30,11 +33,11 @@ export DEBUG= # uncomment/comment to enable/disable debug mode
 
 # WARNING: do NOT skip steps #6 thru #9 or it won't work!
 
-OVPN_DIR="/tmp/ovpn_split"
-OVPN_SPLIT="$OVPN_DIR/ovpn-split.sh"
-OVPN_MONITOR="$OVPN_DIR/ovpn-monitor.sh"
+WORK_DIR="/tmp/ovpn_split"
+OVPN_SPLIT="$WORK_DIR/ovpn-split.sh"
+OVPN_MONITOR="$WORK_DIR/ovpn-monitor.sh"
 
-mkdir -p $OVPN_DIR
+mkdir -p $WORK_DIR
 
 # ----------------------------- BEGIN OVPN_SPLIT ----------------------------- #
 cat << "EOF" > $OVPN_SPLIT
@@ -52,32 +55,46 @@ add_rules() {
 # ---------------------------------------------------------------------------- #
 
 # ------------------------------- BEGIN RULES -------------------------------- #
-#return # uncomment/comment to disable/enable all rules
 add_rule -s 192.168.1.10
 add_rule -p tcp -s 192.168.1.112 --dport 80
 add_rule -p tcp -s 192.168.1.122 --dport 3000:3100
 add_rule -i br1 # guest network
 add_rule -i br2 # iot network
-add_rule -d amazon.com
+add_rule -d amazon.com # domain names NOT recommended
 # -------------------------------- END RULES --------------------------------- #
 :;}
+
+# include user-defined rules
+INCLUDE_USER_DEFINED_RULES= # uncomment/comment to enable/disable
 
 # route openvpn dns server(s) through tunnel
 ROUTE_DNS_THRU_VPN= # uncomment/comment to enable/disable
 
 # ---------------------- DO NOT CHANGE BELOW THIS LINE ----------------------- #
 
-OVPN_CONF="/tmp/openvpncl/openvpn.conf"
-OVPN_ROUTE_UP="/tmp/openvpncl/route-up.sh"
-OVPN_ROUTE_DOWN="/tmp/openvpncl/route-down.sh"
+IMPORT_DIR="$(dirname $0)"
+IMPORT_RULE_EXT="rule"
+IMPORT_RULE_FILESPEC="$IMPORT_DIR/*$IMPORT_RULE_EXT"
 
-ENV_VARS="$OVPN_DIR/env_vars"
-RPF_VARS="$OVPN_DIR/rpf_vars"
+OVPN_DIR="/tmp/openvpncl"
+OVPN_CONF="$OVPN_DIR/openvpn.conf"
+OVPN_ROUTE_UP="$OVPN_DIR/route-up.sh"
+OVPN_ROUTE_DOWN="$OVPN_DIR/route-down.sh"
 
-# make environment variables persistent across openvpn events
-[ "$script_type" == "route-up" ] && env > $ENV_VARS
+ENV_VARS="$WORK_DIR/env_vars"
+RPF_VARS="$WORK_DIR/rpf_vars"
+ADDED_ROUTES="$WORK_DIR/added_routes"
 
-env_get() { echo $(egrep -m1 "^$1=" $ENV_VARS | cut -d = -f2); }
+# initialize work files
+if [ "$script_type" == "route-up" ]; then
+    # make environment variables persistent across openvpn events
+    env > $ENV_VARS
+
+    > $RPF_VARS
+    > $ADDED_ROUTES
+fi
+
+env_get() { echo $(grep -Em1 "^$1=" $ENV_VARS | cut -d = -f2); }
 
 TID="200" # valid values: 1-255
 WAN_GW="$(env_get route_net_gateway)"
@@ -92,46 +109,16 @@ IPT_MAN="iptables -t mangle"
 IPT_MARK_MATCHED="-j MARK --set-mark $FW_MARK"
 IPT_MARK_NOMATCH="-j MARK --set-mark $((FW_MARK + 1))"
 
-add_rule() { $IPT_MAN -A $FW_CHAIN "$@" $IPT_MARK_MATCHED; }
+add_rule() {
+    $IPT_MAN -D $FW_CHAIN "$@" $IPT_MARK_MATCHED 2> /dev/null
+    $IPT_MAN -A $FW_CHAIN "$@" $IPT_MARK_MATCHED
+}
 
 install_nf_modules() {
     for i in $(cat /lib/modules/*/modules.dep | \
-            egrep -o '^.*/(ipt|xt)_[^:]*'); do
+            grep -Eo '^.*/(ipt|xt)_[^:]*'); do
         insmod $i && echo "module added: $i"
     done
-}
-
-handle_openvpn_routes() {
-    local op="$([ "$script_type" == "route-up" ] && echo add || echo del)"
-
-    # route-noexec directive requires client to handle routes
-    if egrep -q '^[[:space:]]*route-noexec' $OVPN_CONF; then
-        local i=0
-
-        # search for openvpn routes
-        while :; do
-            i=$((i + 1))
-            local network="$(env_get route_network_$i)"
-
-            [ $network ] || break
-
-            local netmask="$(env_get route_netmask_$i)"
-            local gateway="$(env_get route_gateway_$i)"
-
-            [ $netmask ] || netmask="255.255.255.255"
-
-            # add/delete host/network route
-            route $op -net $network netmask $netmask gw $gateway
-        done
-    fi
-
-    # route openvpn dns servers through the tunnel
-    if [ ${ROUTE_DNS_THRU_VPN+x} ]; then
-        awk '/dhcp-option DNS/{print $3}' $ENV_VARS \
-          | while read ip; do
-                ip route $op $ip via $VPN_GW
-            done
-    fi
 }
 
 up() {
@@ -140,25 +127,8 @@ up() {
     # call dd-wrt route-up script
     $OVPN_ROUTE_UP
 
-    # special handler for openvpn routes
-    handle_openvpn_routes
-
-    # copy main routing table to alternate (exclude all default gateways)
-    ip route show | egrep -v '^default |^0.0.0.0/1 |^128.0.0.0/1 ' \
-      | while read route; do
-            ip route add $route table $TID
-        done
-
-    if [ "$(env_get redirect_gateway)" == "1" ]; then
-        # add WAN as default gateway to alternate routing table
-        ip route add default via $WAN_GW table $TID
-    else
-        # add VPN as default gateway to alternate routing table
-        ip route add default via $VPN_GW table $TID
-    fi
-
-    # force routing system to recognize changes
-    ip route flush cache
+    # bug fix: http://svn.dd-wrt.com/ticket/5697
+    touch /tmp/resolv.dnsmasq
 
     # add chain for user-defined rules
     $IPT_MAN -N $FW_CHAIN
@@ -178,7 +148,17 @@ up() {
     fi
 
     # add user-defined rules to chain
-    add_rules
+    if [ ${INCLUDE_USER_DEFINED_RULES+x} ]; then
+        local files="$(echo $IMPORT_RULE_FILESPEC)"
+
+        if [ "$files" != "$IMPORT_RULE_FILESPEC" ]; then
+            # import rules from filesystem
+            for file in $files; do . $file; done
+        else
+            # use embedded rules
+            add_rules
+        fi
+    fi
 
     # finalize chain for user-defined rules
     $IPT_MAN -A $FW_CHAIN -m mark ! --mark $FW_MARK $IPT_MARK_NOMATCH
@@ -190,7 +170,56 @@ up() {
     # clear marks (not available on all builds)
     [ -e /proc/net/clear_marks ] && echo 1 > /proc/net/clear_marks
 
-    > $RPF_VARS
+    # route-noexec directive requires client to handle routes
+    if grep -Eq '^[[:space:]]*route-noexec' $OVPN_CONF; then
+        local i=0
+
+        # search for openvpn routes
+        while :; do
+            i=$((i + 1))
+            local network="$(env_get route_network_$i)"
+
+            [ "$network" ] || break
+    
+            local netmask="$(env_get route_netmask_$i)"
+            local gateway="$(env_get route_gateway_$i)"
+
+            [ "$netmask" ] || netmask="255.255.255.255"
+
+            # add host/network route
+            if route add -net $network netmask $netmask gw $gateway; then
+                echo "route del -net $network netmask $netmask gw $gateway" \
+                    >> $ADDED_ROUTES
+            fi
+        done
+    fi
+
+    # route openvpn dns servers through the tunnel
+    if [ ${ROUTE_DNS_THRU_VPN+x} ]; then
+        awk '/dhcp-option DNS/{print $3}' $ENV_VARS \
+          | while read ip; do
+                if ip route add $ip via $VPN_GW; then
+                    echo "ip route del $ip via $VPN_GW" >> $ADDED_ROUTES
+                fi
+            done
+    fi
+
+    # copy main routing table to alternate (exclude all default gateways)
+    ip route show | grep -Ev '^default |^0.0.0.0/1 |^128.0.0.0/1 ' \
+      | while read route; do
+            ip route add $route table $TID
+        done
+
+    if [ "$(env_get redirect_gateway)" == "1" ]; then
+        # add WAN as default gateway to alternate routing table
+        ip route add default via $WAN_GW table $TID
+    else
+        # add VPN as default gateway to alternate routing table
+        ip route add default via $VPN_GW table $TID
+    fi
+
+    # force routing system to recognize changes
+    ip route flush cache
 
     # disable reverse path filtering
     for i in /proc/sys/net/ipv4/conf/*/rp_filter; do
@@ -210,6 +239,9 @@ down() {
     # enable reverse path filtering
     while read i; do echo ${i#*=} > ${i%=*}; done < $RPF_VARS
 
+    # remove added routes
+    while read route; do $route; done < $ADDED_ROUTES
+
     # remove rules
     while $IPT_MAN -D PREROUTING -j $FW_CHAIN 2> /dev/null
         do :; done
@@ -223,14 +255,11 @@ down() {
     # delete alternate routing table
     ip route flush table $TID
 
-    # special handler for openvpn routes
-    handle_openvpn_routes
-
     # force routing system to recognize changes
     ip route flush cache
 
-    # cleanup
-    rm -f $ENV_VARS $RPF_VARS
+    # cleanup work files
+    rm -f $ENV_VARS $RPF_VARS $ADDED_ROUTES
 
     # call dd-wrt route-pre-down script
     $OVPN_ROUTE_DOWN
@@ -257,14 +286,16 @@ main
 
 ) 2>&1 | logger -t $(basename $0)[$$]
 EOF
-sed -i "s:\$OVPN_DIR:$OVPN_DIR:" $OVPN_SPLIT
-[ ${DEBUG+x} ] || sed -ri 's/^DEBUG=/#DEBUG=/' $OVPN_SPLIT
+sed -i \
+-e "s:\$WORK_DIR:$WORK_DIR:g" \
+-e "s:\$(dirname \$0):$(dirname $0):g" $OVPN_SPLIT
+[ ${DEBUG+x} ] || sed -ri 's/^DEBUG=/#DEBUG=/g' $OVPN_SPLIT
 chmod +x $OVPN_SPLIT
 # ------------------------------ END OVPN_SPLIT ------------------------------ #
 
 # create symbolic links for script
-ln -sf $OVPN_SPLIT $OVPN_DIR/route-up
-ln -sf $OVPN_SPLIT $OVPN_DIR/route-pre-down
+ln -sf $OVPN_SPLIT $WORK_DIR/route-up
+ln -sf $OVPN_SPLIT $WORK_DIR/route-pre-down
 
 # ---------------------------- BEGIN OVPN_MONITOR ---------------------------- #
 cat << "EOF" > $OVPN_MONITOR
@@ -275,11 +306,10 @@ DEBUG=
 
 # uncomment/comment to enable/disable the following options
 #ONE_PASS= # one pass only; do NOT run continously in background
-ENABLE_SECURE_FIREWALL= # http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
-ENABLE_NAT_LOOPBACK= # replaces dd-wrt nat loopback
+CONFIG_SECURE_FIREWALL= # http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
+CONFIG_NAT_LOOPBACK= # replaces dd-wrt nat loopback
 #DEL_PERSIST_TUN= # may help w/ "N RESOLVE" problems
 #DEL_MTU_DISC= # http://svn.dd-wrt.com/ticket/5718
-TOUCH_DNSMASQ= # http://svn.dd-wrt.com/ticket/5697
 
 # ---------------------- DO NOT CHANGE BELOW THIS LINE ----------------------- #
 
@@ -290,11 +320,10 @@ SLEEP=10
 
 curr_pid=""
 
-enable_secure_firewall() {
+configure_secure_firewall() {
     _ipt() {
         # precede insert/append w/ deletion to avoid dups
-        while iptables ${@/-[IA]/-D} 2> /dev/null
-            do :; done
+        while iptables ${@/-[IA]/-D} 2> /dev/null; do :; done
         iptables $@
     }
 
@@ -311,7 +340,7 @@ enable_secure_firewall() {
     fi
 }
 
-enable_nat_loopback() {
+configure_nat_loopback() {
     local i=""
 
     # search for local ip networks
@@ -333,7 +362,7 @@ enable_nat_loopback() {
     done
 }
 
-config_add() { egrep -q "^$1$" $OVPN_CONF || echo "$1" >> $OVPN_CONF; }
+config_add() { grep -Eq "^$1$" $OVPN_CONF || echo "$1" >> $OVPN_CONF; }
 config_rep() { sed -ri "s/^$1$/$2/" $OVPN_CONF; }
 config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # note: lazy match
 
@@ -347,7 +376,7 @@ while ! grep -qi '[i]nitialization sequence completed' /var/log/messages
 err_found=false
 
 # policy based routing must be disabled (ip rules conflict)
-if [ $(nvram get openvpncl_route) ]; then
+if [ "$(nvram get openvpncl_route)" ]; then
     echo "fatal error: policy based routing must be disabled"
     err_found=true
 fi
@@ -378,26 +407,23 @@ while :; do
     while   pidof openvpn > /dev/null 2>&1; do sleep $SLEEP; done
 
     # make adjustments to openvpn config file
-    [ ${ENABLE_SECURE_FIREWALL+x} ] && config_add 'dev tun0'
+    [ ${CONFIG_SECURE_FIREWALL+x} ] && config_add 'dev tun0'
     [ ${DEL_PERSIST_TUN+x} ] && config_del persist-tun
     [ ${DEL_MTU_DISC+x} ] && config_del mtu-disc
 
     # restart openvpn client w/ our configuration changes
     if ! openvpn --config $OVPN_CONF \
-                 --route-up $OVPN_DIR/route-up \
-                 --route-pre-down $OVPN_DIR/route-pre-down \
+                 --route-up $WORK_DIR/route-up \
+                 --route-pre-down $WORK_DIR/route-pre-down \
                  --daemon; then
         continue
     fi
 
     # optional: http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
-    [ ${ENABLE_SECURE_FIREWALL+x} ] && enable_secure_firewall
+    [ ${CONFIG_SECURE_FIREWALL+x} ] && configure_secure_firewall
 
     # optional: enable nat loopback (no packet marking conflicts)
-    [ ${ENABLE_NAT_LOOPBACK+x} ] && enable_nat_loopback
-
-    # optional: http://svn.dd-wrt.com/ticket/5697
-    [ ${TOUCH_DNSMASQ+x} ] && touch /tmp/resolv.dnsmasq
+    [ ${CONFIG_NAT_LOOPBACK+x} ] && configure_nat_loopback
 
     # optional: limit to one pass
     [ ${ONE_PASS+x} ] && { echo "done"; exit; }
@@ -413,8 +439,8 @@ while :; do
 done
 ) 2>&1 | logger -t $(basename $0)[$$]
 EOF
-sed -i "s:\$OVPN_DIR:$OVPN_DIR:" $OVPN_MONITOR
-[ ${DEBUG+x} ] || sed -ri 's/^DEBUG=/#DEBUG=/' $OVPN_MONITOR
+sed -i "s:\$WORK_DIR:$WORK_DIR:g" $OVPN_MONITOR
+[ ${DEBUG+x} ] || sed -ri 's/^DEBUG=/#DEBUG=/g' $OVPN_MONITOR
 chmod +x $OVPN_MONITOR
 # ----------------------------- END OVPN_MONITOR ----------------------------- #
 
