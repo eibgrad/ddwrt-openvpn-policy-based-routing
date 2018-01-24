@@ -2,7 +2,7 @@
 export DEBUG= # uncomment/comment to enable/disable debug mode
 
 #         name: ddwrt-ovpn-split-basic.sh
-#      version: 0.1.6 (beta), 09-apr-2017, by eibgrad
+#      version: 1.0.0, 15-jan-2018, by eibgrad
 #      purpose: redirect specific traffic over the WAN|VPN
 #  script type: jffs script called from startup script
 # instructions:
@@ -23,8 +23,7 @@ export DEBUG= # uncomment/comment to enable/disable debug mode
 #   7. enable syslogd (services->services->system log)
 #   8. reboot router
 #  limitations:
-#    - this script is NOT compatible w/ policy based routing in the
-#      openvpn client gui
+#    - this script is NOT compatible w/ dd-wrt policy based routing
 #    - rules are limited to source ip/network/interface and destination
 #      ip/network; split tunneling within any given source or destination
 #      (protocol, port, etc.) is NOT supported
@@ -74,6 +73,7 @@ add_rule from 192.168.2.0/24 to 133.133.133.0/24
 
 # -------------------------------- END RULES --------------------------------- #
 :;}
+# ------------------------------ BEGIN OPTIONS ------------------------------- #
 
 # include user-defined rules
 INCLUDE_USER_DEFINED_RULES= # uncomment/comment to enable/disable
@@ -81,11 +81,13 @@ INCLUDE_USER_DEFINED_RULES= # uncomment/comment to enable/disable
 # route openvpn dns server(s) through tunnel
 ROUTE_DNS_THRU_VPN= # uncomment/comment to enable/disable
 
+# ------------------------------- END OPTIONS -------------------------------- #
+
 # ---------------------- DO NOT CHANGE BELOW THIS LINE ----------------------- #
 
 IMPORT_DIR="$(dirname $0)"
 IMPORT_RULE_EXT="rule"
-IMPORT_RULE_FILESPEC="$IMPORT_DIR/*$IMPORT_RULE_EXT"
+IMPORT_RULE_FILESPEC="$IMPORT_DIR/*.$IMPORT_RULE_EXT"
 
 OVPN_DIR="/tmp/openvpncl"
 OVPN_CONF="$OVPN_DIR/openvpn.conf"
@@ -125,15 +127,14 @@ up() {
 
     # route-noexec directive requires client to handle routes
     if grep -Eq '^[[:space:]]*route-noexec' $OVPN_CONF; then
-        local i=0
+        local i=1
 
         # search for openvpn routes
         while :; do
-            i=$((i + 1))
             local network="$(env_get route_network_$i)"
 
             [ "$network" ] || break
-    
+
             local netmask="$(env_get route_netmask_$i)"
             local gateway="$(env_get route_gateway_$i)"
 
@@ -144,6 +145,8 @@ up() {
                 echo "route del -net $network netmask $netmask gw $gateway" \
                     >> $ADDED_ROUTES
             fi
+
+            i=$((i + 1))
         done
     fi
 
@@ -228,8 +231,8 @@ main
 ) 2>&1 | logger -t $(basename $0)[$$]
 EOF
 sed -i \
--e "s:\$WORK_DIR:$WORK_DIR:g" \
--e "s:\$(dirname \$0):$(dirname $0):g" $OVPN_SPLIT
+    -e "s:\$WORK_DIR:$WORK_DIR:g" \
+    -e "s:\$(dirname \$0):$(dirname $0):g" $OVPN_SPLIT
 [ ${DEBUG+x} ] || sed -ri 's/^DEBUG=/#DEBUG=/g' $OVPN_SPLIT
 chmod +x $OVPN_SPLIT
 # ------------------------------ END OVPN_SPLIT ------------------------------ #
@@ -245,11 +248,20 @@ DEBUG=
 (
 [ ${DEBUG+x} ] && set -x
 
-# uncomment/comment to enable/disable the following options
-#ONE_PASS= # one pass only; do NOT run continously in background
-CONFIG_SECURE_FIREWALL= # http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
-#DEL_PERSIST_TUN= # may help w/ "N RESOLVE" problems
-#DEL_MTU_DISC= # http://svn.dd-wrt.com/ticket/5718
+# one pass only; do NOT run continously in background
+#ONE_PASS= # uncomment/comment to enable/disable
+
+# http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
+CONFIG_SECURE_FIREWALL= # uncomment/comment to enable/disable
+
+# replace dd-wrt nat loopback w/ compatible implementation
+CONFIG_NAT_LOOPBACK= # uncomment/comment to enable/disable
+
+# may help w/ "N RESOLVE" and soft-restart problems
+#DEL_PERSIST_TUN= # uncomment/comment to enable/disable
+
+# http://svn.dd-wrt.com/ticket/5718
+#DEL_MTU_DISC= # uncomment/comment to enable/disable
 
 # ---------------------- DO NOT CHANGE BELOW THIS LINE ----------------------- #
 
@@ -282,7 +294,7 @@ configure_secure_firewall() {
 
 config_add() { grep -Eq "^$1$" $OVPN_CONF || echo "$1" >> $OVPN_CONF; }
 config_rep() { sed -ri "s/^$1$/$2/" $OVPN_CONF; }
-config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # note: lazy match
+config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # lazy match
 
 # wait for syslog to come up
 while [ ! -e /var/log/messages ]; do sleep $SLEEP; done
