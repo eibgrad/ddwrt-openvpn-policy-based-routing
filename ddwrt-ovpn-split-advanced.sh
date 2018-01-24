@@ -2,7 +2,7 @@
 export DEBUG= # uncomment/comment to enable/disable debug mode
 
 #         name: ddwrt-ovpn-split-advanced.sh
-#      version: 0.1.6 (beta), 09-apr-2017, by eibgrad
+#      version: 1.0.0, 15-jan-2018, by eibgrad
 #      purpose: redirect specific traffic over the WAN|VPN
 #  script type: jffs script called from startup script
 # instructions:
@@ -16,8 +16,8 @@ export DEBUG= # uncomment/comment to enable/disable debug mode
 #   4. call this script from the startup script:
 #        /jffs/ddwrt-ovpn-split-advanced.sh
 #   5. optional: to set/lockdown the default gateway to WAN/ISP and use
-#      rules to reroute to VPN, add the following to the openvpn client
-#      additional config field:
+#      rules to reroute to VPN, add the following directive to the openvpn
+#      client additional config field:
 #        route-noexec
 #   6. disable policy based routing (services->vpn->openvpn client)
 #   7. disable nat loopback (security->firewall, "filter wan nat redirection"
@@ -26,10 +26,9 @@ export DEBUG= # uncomment/comment to enable/disable debug mode
 #   9. enable syslogd (services->services->system log)
 #  10. reboot router
 #  limitations:
-#    - this script is NOT compatible w/ policy based routing in the
-#      openvpn client gui
-#    - this script is NOT compatible w/ nat loopback
-#    - this script is NOT compatible w/ qos
+#    - this script is NOT compatible w/ dd-wrt policy based routing
+#    - this script is NOT compatible w/ dd-wrt nat loopback
+#    - this script is NOT compatible w/ dd-wrt qos
 
 # WARNING: do NOT skip steps #6 thru #9 or it won't work!
 
@@ -59,10 +58,11 @@ add_rule -s 192.168.1.10
 add_rule -p tcp -s 192.168.1.112 --dport 80
 add_rule -p tcp -s 192.168.1.122 --dport 3000:3100
 add_rule -i br1 # guest network
-add_rule -i br2 # iot network
+#add_rule -i br2 # iot network
 add_rule -d amazon.com # domain names NOT recommended
 # -------------------------------- END RULES --------------------------------- #
 :;}
+# ------------------------------ BEGIN OPTIONS ------------------------------- #
 
 # include user-defined rules
 INCLUDE_USER_DEFINED_RULES= # uncomment/comment to enable/disable
@@ -70,11 +70,13 @@ INCLUDE_USER_DEFINED_RULES= # uncomment/comment to enable/disable
 # route openvpn dns server(s) through tunnel
 ROUTE_DNS_THRU_VPN= # uncomment/comment to enable/disable
 
+# ------------------------------- END OPTIONS -------------------------------- #
+
 # ---------------------- DO NOT CHANGE BELOW THIS LINE ----------------------- #
 
 IMPORT_DIR="$(dirname $0)"
 IMPORT_RULE_EXT="rule"
-IMPORT_RULE_FILESPEC="$IMPORT_DIR/*$IMPORT_RULE_EXT"
+IMPORT_RULE_FILESPEC="$IMPORT_DIR/*.$IMPORT_RULE_EXT"
 
 OVPN_DIR="/tmp/openvpncl"
 OVPN_CONF="$OVPN_DIR/openvpn.conf"
@@ -110,15 +112,9 @@ IPT_MARK_MATCHED="-j MARK --set-mark $FW_MARK"
 IPT_MARK_NOMATCH="-j MARK --set-mark $((FW_MARK + 1))"
 
 add_rule() {
+    # precede addition w/ deletion to avoid dupes
     $IPT_MAN -D $FW_CHAIN "$@" $IPT_MARK_MATCHED 2> /dev/null
     $IPT_MAN -A $FW_CHAIN "$@" $IPT_MARK_MATCHED
-}
-
-install_nf_modules() {
-    for i in $(cat /lib/modules/*/modules.dep | \
-            grep -Eo '^.*/(ipt|xt)_[^:]*'); do
-        insmod $i && echo "module added: $i"
-    done
 }
 
 up() {
@@ -152,7 +148,7 @@ up() {
         local files="$(echo $IMPORT_RULE_FILESPEC)"
 
         if [ "$files" != "$IMPORT_RULE_FILESPEC" ]; then
-            # import (source) rules from filesystem
+            # ignore embedded rules; import/source rules from filesystem
             for file in $files; do . $file; done
         else
             # use embedded rules
@@ -172,15 +168,14 @@ up() {
 
     # route-noexec directive requires client to handle routes
     if grep -Eq '^[[:space:]]*route-noexec' $OVPN_CONF; then
-        local i=0
+        local i=1
 
         # search for openvpn routes
         while :; do
-            i=$((i + 1))
             local network="$(env_get route_network_$i)"
 
             [ "$network" ] || break
-    
+
             local netmask="$(env_get route_netmask_$i)"
             local gateway="$(env_get route_gateway_$i)"
 
@@ -191,6 +186,8 @@ up() {
                 echo "route del -net $network netmask $netmask gw $gateway" \
                     >> $ADDED_ROUTES
             fi
+
+            i=$((i + 1))
         done
     fi
 
@@ -269,9 +266,6 @@ main() {
     # reject cli invocation; script only applicable to routed (tun) tunnels
     [[ -t 0 || "$(env_get dev_type)" != "tun" ]] && return 1
 
-    # install additional netfilter modules
-    install_nf_modules
-
     # trap event-driven callbacks by openvpn and take appropriate action(s)
     case "$script_type" in
               "route-up")   up;;
@@ -287,8 +281,8 @@ main
 ) 2>&1 | logger -t $(basename $0)[$$]
 EOF
 sed -i \
--e "s:\$WORK_DIR:$WORK_DIR:g" \
--e "s:\$(dirname \$0):$(dirname $0):g" $OVPN_SPLIT
+    -e "s:\$WORK_DIR:$WORK_DIR:g" \
+    -e "s:\$(dirname \$0):$(dirname $0):g" $OVPN_SPLIT
 [ ${DEBUG+x} ] || sed -ri 's/^DEBUG=/#DEBUG=/g' $OVPN_SPLIT
 chmod +x $OVPN_SPLIT
 # ------------------------------ END OVPN_SPLIT ------------------------------ #
@@ -304,12 +298,27 @@ DEBUG=
 (
 [ ${DEBUG+x} ] && set -x
 
-# uncomment/comment to enable/disable the following options
-#ONE_PASS= # one pass only; do NOT run continously in background
-CONFIG_SECURE_FIREWALL= # http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
-CONFIG_NAT_LOOPBACK= # replaces dd-wrt nat loopback
-#DEL_PERSIST_TUN= # may help w/ "N RESOLVE" problems
-#DEL_MTU_DISC= # http://svn.dd-wrt.com/ticket/5718
+# ------------------------------ BEGIN OPTIONS ------------------------------- #
+
+# one pass only; do NOT run continously in background
+#ONE_PASS= # uncomment/comment to enable/disable
+
+# install additional netfilter modules
+INSTALL_NF_MODULES= # uncomment/comment to enable/disable
+
+# http://www.dd-wrt.com/phpBB2/viewtopic.php?t=307445
+CONFIG_SECURE_FIREWALL= # uncomment/comment to enable/disable
+
+# replace dd-wrt nat loopback w/ compatible implementation
+CONFIG_NAT_LOOPBACK= # uncomment/comment to enable/disable
+
+# may help w/ "N RESOLVE" and soft-restart problems
+#DEL_PERSIST_TUN= # uncomment/comment to enable/disable
+
+# http://svn.dd-wrt.com/ticket/5718
+#DEL_MTU_DISC= # uncomment/comment to enable/disable
+
+# ------------------------------- END OPTIONS -------------------------------- #
 
 # ---------------------- DO NOT CHANGE BELOW THIS LINE ----------------------- #
 
@@ -320,9 +329,16 @@ SLEEP=10
 
 curr_pid=""
 
+install_nf_modules() {
+    for mod in $(find /lib/modules -type f -name '*.ko'); do
+        echo $mod | grep -qE '^.*/(ipt|xt)_.*$' && \
+            insmod $mod 2> /dev/null && echo "module added: $mod"
+    done
+}
+
 configure_secure_firewall() {
     _ipt() {
-        # precede insert/append w/ deletion to avoid dups
+        # precede insert/append w/ deletion to avoid dupes
         while iptables ${@/-[IA]/-D} 2> /dev/null; do :; done
         iptables $@
     }
@@ -362,9 +378,33 @@ configure_nat_loopback() {
     done
 }
 
+verify_prerequsites() {
+    local err_found=false
+
+    # policy based routing must be disabled (ip rules conflict)
+    if [ "$(nvram get openvpncl_route)" ]; then
+        echo "fatal error: policy based routing must be disabled"
+        err_found=true
+    fi
+
+    # nat loopback must be disabled (packet marking conflict)
+    if [ "$(nvram get block_loopback)" == "0" ]; then
+        echo "fatal error: nat loopback must be disabled"
+        err_found=true
+    fi
+
+    # qos must be disabled (packet marking conflict)
+    if [ "$(nvram get wshaper_enable)" == "1" ]; then
+        echo "fatal error: qos must be disabled"
+        err_found=true
+    fi
+
+    [[ err_found == true ]] && return 1 || return 0
+}
+
 config_add() { grep -Eq "^$1$" $OVPN_CONF || echo "$1" >> $OVPN_CONF; }
-config_rep() { sed -ri "s/^$1$/$2/" $OVPN_CONF; }
-config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # note: lazy match
+config_chg() { sed -ri "s/^$1$/$2/" $OVPN_CONF; }
+config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # lazy match
 
 # wait for syslog to come up
 while [ ! -e /var/log/messages ]; do sleep $SLEEP; done
@@ -373,31 +413,11 @@ while [ ! -e /var/log/messages ]; do sleep $SLEEP; done
 while ! grep -qi '[i]nitialization sequence completed' /var/log/messages
     do sleep $SLEEP; done
 
-err_found=false
-
-# policy based routing must be disabled (ip rules conflict)
-if [ "$(nvram get openvpncl_route)" ]; then
-    echo "fatal error: policy based routing must be disabled"
-    err_found=true
-fi
-
-# nat loopback must be disabled (packet marking conflict)
-if [ "$(nvram get block_loopback)" == "0" ]; then
-    echo "fatal error: nat loopback must be disabled"
-    err_found=true
-fi
-
-# qos must be disabled (packet marking conflict)
-if [ "$(nvram get wshaper_enable)" == "1" ]; then
-    echo "fatal error: qos must be disabled"
-    err_found=true
-fi
-
 # quit if we fail to meet any prerequisites
-if [[ $err_found == true ]]; then
-    echo "exiting on fatal error(s); correct and reboot"
-    exit
-fi
+verify_prerequsites || { echo "exiting on fatal error(s)"; exit 1; }
+
+# install additional netfilter modules
+[ ${INSTALL_NF_MODULES+x} ] && install_nf_modules
 
 # monitor openvpn client start/stop
 while :; do
