@@ -2,7 +2,7 @@
 export DEBUG= # uncomment/comment to enable/disable debug mode
 
 #         name: ddwrt-ovpn-split-advanced.sh
-#      version: 1.0.0, 15-jan-2018, by eibgrad
+#      version: 1.1.0, 20-feb-2018, by eibgrad
 #      purpose: redirect specific traffic over the WAN|VPN
 #  script type: jffs script called from startup script
 # instructions:
@@ -327,8 +327,6 @@ OVPN_PID="/tmp/var/run/openvpncl.pid"
 
 SLEEP=10
 
-curr_pid=""
-
 install_nf_modules() {
     for mod in $(find /lib/modules -type f -name '*.ko'); do
         echo $mod | grep -qE '^.*/(ipt|xt)_.*$' && \
@@ -383,48 +381,65 @@ verify_prerequsites() {
 
     # policy based routing must be disabled (ip rules conflict)
     if [ "$(nvram get openvpncl_route)" ]; then
-        echo "fatal error: policy based routing must be disabled"
+        echo "error: policy based routing must be disabled"
         err_found=true
     fi
 
     # nat loopback must be disabled (packet marking conflict)
     if [ "$(nvram get block_loopback)" == "0" ]; then
-        echo "fatal error: nat loopback must be disabled"
+        echo "error: nat loopback must be disabled"
         err_found=true
     fi
 
     # qos must be disabled (packet marking conflict)
     if [ "$(nvram get wshaper_enable)" == "1" ]; then
-        echo "fatal error: qos must be disabled"
+        echo "error: qos must be disabled"
         err_found=true
     fi
 
-    [[ err_found == true ]] && return 1 || return 0
+    [[ $err_found == true ]] && return 1 || return 0
 }
 
 config_add() { grep -Eq "^$1$" $OVPN_CONF || echo "$1" >> $OVPN_CONF; }
 config_chg() { sed -ri "s/^$1$/$2/" $OVPN_CONF; }
 config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # lazy match
 
-# wait for syslog to come up
-while [ ! -e /var/log/messages ]; do sleep $SLEEP; done
-
-# wait for initial openvpn client connection to be established
-while ! grep -qi '[i]nitialization sequence completed' /var/log/messages
-    do sleep $SLEEP; done
-
-# quit if we fail to meet any prerequisites
-verify_prerequsites || { echo "exiting on fatal error(s)"; exit 1; }
-
 # install additional netfilter modules
 [ ${INSTALL_NF_MODULES+x} ] && install_nf_modules
 
-# monitor openvpn client start/stop
+# wait for syslog to come up
+while ! pidof syslogd > /dev/null 2>&1; do sleep $SLEEP; done
+
+curr_pid=""
+
+# monitor openvpn client start/restart/stop
 while :; do
-    # wait for openvpn client to (re)start, then kill it
-    while ! pidof openvpn > /dev/null 2>&1; do sleep $SLEEP; done
-    while ! killall openvpn; do sleep $SLEEP; done
-    while   pidof openvpn > /dev/null 2>&1; do sleep $SLEEP; done
+    # wait for openvpn client to start/restart (process id will appear/change)
+    while [ "$(cat $OVPN_PID 2> /dev/null)" == "$curr_pid" ]
+        do sleep $((SLEEP * 2)); done
+
+    curr_pid="$(cat $OVPN_PID 2> /dev/null)"
+
+    # verify any prerequisites
+    verify_prerequsites || continue
+
+    # wait for openvpn client connection to be established
+    while :; do
+        # search syslog (from newest to oldest files)
+        for file in /var/log/messages*; do
+            # search file (from newest to oldest entries)
+            sed '1!G;h;$!d' $file | \
+                grep -qi "\[$curr_pid\].*[i]nitialization sequence completed" && break 2
+        done
+
+        # if the openvpn process has been stopped/restarted, start over
+        ps | grep "^[ ]*$curr_pid " && sleep $SLEEP || continue 2
+    done
+
+    # terminate the current openvpn client process
+    while ! kill $(cat $OVPN_PID); do sleep $SLEEP; done
+    while ps | grep -q "^[ ]*$(cat $OVPN_PID) "
+        do sleep $SLEEP; done
 
     # make adjustments to openvpn config file
     [ ${CONFIG_SECURE_FIREWALL+x} ] && config_add 'dev tun0'
@@ -452,10 +467,6 @@ while :; do
     while [ "$(cat $OVPN_PID)" == "$curr_pid" ]
         do sleep $((SLEEP / 2)); done
     curr_pid="$(cat $OVPN_PID)"
-
-    # wait for openvpn client to stop/restart (process id will change)
-    while [ "$(pidof openvpn)" == "$curr_pid" ]
-        do sleep $((SLEEP * 2)); done
 done
 ) 2>&1 | logger -t $(basename $0)[$$]
 EOF
