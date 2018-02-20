@@ -2,7 +2,7 @@
 export DEBUG= # uncomment/comment to enable/disable debug mode
 
 #         name: ddwrt-ovpn-split-basic.sh
-#      version: 1.0.0, 15-jan-2018, by eibgrad
+#      version: 1.1.0, 20-feb-2018, by eibgrad
 #      purpose: redirect specific traffic over the WAN|VPN
 #  script type: jffs script called from startup script
 # instructions:
@@ -270,8 +270,6 @@ OVPN_PID="/tmp/var/run/openvpncl.pid"
 
 SLEEP=10
 
-curr_pid=""
-
 configure_secure_firewall() {
     _ipt() {
         # precede insert/append w/ deletion to avoid dups
@@ -297,25 +295,41 @@ config_rep() { sed -ri "s/^$1$/$2/" $OVPN_CONF; }
 config_del() { sed -ri "/^$1/d" $OVPN_CONF; } # lazy match
 
 # wait for syslog to come up
-while [ ! -e /var/log/messages ]; do sleep $SLEEP; done
+while ! pidof syslogd > /dev/null 2>&1; do sleep $SLEEP; done
 
-# wait for initial openvpn client connection to be established
-while ! grep -qi '[i]nitialization sequence completed' /var/log/messages
-    do sleep $SLEEP; done
+curr_pid=""
 
-# policy based routing must be disabled (ip rules conflict)
-if [ "$(nvram get openvpncl_route)" ]; then
-    echo "fatal error: policy based routing must be disabled"
-    echo "exiting on fatal error; correct and reboot"
-    exit
-fi
-
-# monitor openvpn client start/stop
+# monitor openvpn client start/restart/stop
 while :; do
-    # wait for openvpn client to (re)start, then kill it
-    while ! pidof openvpn > /dev/null 2>&1; do sleep $SLEEP; done
-    while ! killall openvpn; do sleep $SLEEP; done
-    while   pidof openvpn > /dev/null 2>&1; do sleep $SLEEP; done
+    # wait for openvpn client to start/restart (process id will appear/change)
+    while [ "$(cat $OVPN_PID 2> /dev/null)" == "$curr_pid" ]
+        do sleep $((SLEEP * 2)); done
+
+    curr_pid="$(cat $OVPN_PID 2> /dev/null)"
+
+    # policy based routing must be disabled (ip rules conflict)
+    if [ "$(nvram get openvpncl_route)" ]; then
+        echo "error: policy based routing must be disabled"
+        continue
+    fi
+
+    # wait for openvpn client connection to be established
+    while :; do
+        # search syslog (from newest to oldest files)
+        for file in /var/log/messages*; do
+            # search file (from newest to oldest entries)
+            sed '1!G;h;$!d' $file | \
+                grep -qi "\[$curr_pid\].*[i]nitialization sequence completed" && break 2
+        done
+
+        # if the openvpn process has been stopped/restarted, start over
+        ps | grep "^[ ]*$curr_pid " && sleep $SLEEP || continue 2
+    done
+
+    # terminate the current openvpn client process
+    while ! kill $(cat $OVPN_PID); do sleep $SLEEP; done
+    while ps | grep -q "^[ ]*$(cat $OVPN_PID) "
+        do sleep $SLEEP; done
 
     # make adjustments to openvpn config file
     [ ${CONFIG_SECURE_FIREWALL+x} ] && config_add 'dev tun0'
@@ -334,16 +348,12 @@ while :; do
     [ ${CONFIG_SECURE_FIREWALL+x} ] && configure_secure_firewall
 
     # optional: limit to one pass
-    [ ${ONE_PASS+x} ] && { echo "done"; exit; }
+    [ ${ONE_PASS+x} ] && { echo "done"; exit 0; }
 
     # wait for change in process id, then save it
     while [ "$(cat $OVPN_PID)" == "$curr_pid" ]
         do sleep $((SLEEP / 2)); done
     curr_pid="$(cat $OVPN_PID)"
-
-    # wait for openvpn client to stop/restart (process id will change)
-    while [ "$(pidof openvpn)" == "$curr_pid" ]
-        do sleep $((SLEEP * 2)); done
 done
 ) 2>&1 | logger -t $(basename $0)[$$]
 EOF
